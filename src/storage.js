@@ -10,8 +10,8 @@ const DEFAULT_CONFIG = {
     onboarded: false,
     layout: 'normal',
     geminiLiveModel: 'gemini-3.8-live',
-    groqModel: 'qwen/qwen3.6-27b',
-    groqImageModel: 'qwen/qwen3.6-27b',
+    groqModel: 'qwen/qwen3.8-27b',
+    groqImageModel: 'qwen/qwen3.8-27b',
     disableGroqThinking: true,
 };
 
@@ -172,6 +172,12 @@ function getConfig() {
         saved.geminiLiveModel = DEFAULT_CONFIG.geminiLiveModel;
         saved.liveModelMigrated = true;
         writeJsonFile(getConfigPath(), saved);
+    }
+    // Groq retired qwen3.6-27b, so a saved choice of it would only ever 404
+    for (const key of ['groqModel', 'groqImageModel']) {
+        if (saved[key] === 'qwen/qwen3.6-27b') {
+            delete saved[key];
+        }
     }
     return { ...DEFAULT_CONFIG, ...saved };
 }
