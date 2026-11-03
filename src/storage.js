@@ -9,7 +9,7 @@ const DEFAULT_CONFIG = {
     configVersion: CONFIG_VERSION,
     onboarded: false,
     layout: 'normal',
-    geminiLiveModel: 'gemini-3.1-flash-live-preview',
+    geminiLiveModel: 'gemini-3.8-live',
     groqModel: 'qwen/qwen3.6-27b',
     groqImageModel: 'qwen/qwen3.6-27b',
     disableGroqThinking: true,
@@ -166,6 +166,10 @@ function initializeStorage() {
 
 function getConfig() {
     const saved = readJsonFile(getConfigPath(), {});
+    // Existing installs saved the old default live model, which Google now marks as legacy
+    if (saved.geminiLiveModel === 'gemini-3.1-flash-live-preview') {
+        delete saved.geminiLiveModel;
+    }
     return { ...DEFAULT_CONFIG, ...saved };
 }
 
