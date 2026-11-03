@@ -3,7 +3,7 @@ const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
-const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getConfig } = require('../storage');
+const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getConfig, getPreferences } = require('../storage');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
 
@@ -158,11 +158,11 @@ function getCurrentSessionData() {
 async function getEnabledTools() {
     const tools = [];
 
-    // Check if Google Search is enabled (default: true)
-    const googleSearchEnabled = await getStoredSetting('googleSearchEnabled', 'true');
+    // The Customize view saves this toggle to preferences, not localStorage
+    const googleSearchEnabled = getPreferences().googleSearchEnabled === true;
     console.log('Google Search enabled:', googleSearchEnabled);
 
-    if (googleSearchEnabled === 'true') {
+    if (googleSearchEnabled) {
         tools.push({ googleSearch: {} });
         console.log('Added Google Search tool');
     } else {
