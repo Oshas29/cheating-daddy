@@ -3,7 +3,16 @@ const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
-const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getConfig, getPreferences } = require('../storage');
+const {
+    getAvailableModel,
+    incrementLimitCount,
+    markModelExhausted,
+    getApiKey,
+    getGroqApiKey,
+    incrementCharUsage,
+    getConfig,
+    getPreferences,
+} = require('../storage');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
 
@@ -211,6 +220,30 @@ function hasGroqKey() {
     return key && key.trim() != '';
 }
 
+// When Groq says we're over a limit, answer with Gemini until Groq's retry-after passes
+let groqBlockedUntil = 0;
+
+function isGroqAvailable() {
+    return hasGroqKey() && Date.now() >= groqBlockedUntil;
+}
+
+function noteGroqRateLimit(response) {
+    const retryAfter = Number(response.headers.get('retry-after'));
+    const seconds = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 60;
+    groqBlockedUntil = Date.now() + seconds * 1000;
+    console.log(`Groq limit reached, using Gemini for the next ${seconds}s`);
+}
+
+function isGeminiQuotaError(error) {
+    const text = String(error?.message || error);
+    return error?.status === 429 || text.includes('RESOURCE_EXHAUSTED') || text.includes('429');
+}
+
+// Google names the quota it hit; only a per-day one means the model is done until the reset
+function isGeminiDailyQuotaError(error) {
+    return isGeminiQuotaError(error) && String(error?.message || error).includes('PerDay');
+}
+
 function sendFinalTranscriptionToGroq() {
     if (!hasGroqKey() || groqRequestStartedForTurn) {
         return;
@@ -284,6 +317,10 @@ async function sendToGroq(transcription) {
         return;
     }
 
+    if (!isGroqAvailable()) {
+        return sendToGeminiText(transcription);
+    }
+
     const config = getConfig();
     const modelToUse = config.groqModel;
 
@@ -301,6 +338,14 @@ async function sendToGroq(transcription) {
     if (groqConversationHistory.length > 20) {
         groqConversationHistory = groqConversationHistory.slice(-20);
     }
+
+    // Gemini re-adds the question to history itself, so drop ours before handing over
+    const answerWithGemini = () => {
+        groqConversationHistory.pop();
+        sendToRenderer('update-status', 'Groq unavailable, answering with Gemini');
+        return sendToGeminiText(transcription);
+    };
+    let streamStarted = false;
 
     try {
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -326,14 +371,17 @@ async function sendToGroq(transcription) {
                 status: response.status,
                 body: errorText,
             });
-            sendToRenderer('update-status', `Groq error: ${response.status}`);
-            return;
+            if (response.status === 429) {
+                noteGroqRateLimit(response);
+            }
+            return answerWithGemini();
         }
 
         logTransportEvent('groq.text.http_response', {
             status: response.status,
         });
 
+        streamStarted = true;
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let fullText = '';
@@ -417,6 +465,9 @@ async function sendToGroq(transcription) {
             error: error.message,
             stack: error.stack,
         });
+        if (!streamStarted) {
+            return answerWithGemini();
+        }
         sendToRenderer('update-status', 'Groq error: ' + error.message);
     }
 }
@@ -470,6 +521,9 @@ async function sendImageToGroq(base64Data, prompt) {
                 status: response.status,
                 body: errorText,
             });
+            if (response.status === 429) {
+                noteGroqRateLimit(response);
+            }
             return { success: false, error: `Groq error: ${response.status}` };
         }
 
@@ -545,7 +599,10 @@ async function sendImageToGroq(base64Data, prompt) {
     }
 }
 
-async function sendToGemma(transcription) {
+// Answers spoken questions when Groq can't. Flash Lite: fastest, with the largest free daily quota.
+const GEMINI_TEXT_FALLBACK_MODEL = 'gemini-3.5-flash-lite';
+
+async function sendToGeminiText(transcription) {
     const apiKey = getApiKey();
     if (!apiKey) {
         console.log('No Gemini API key configured');
@@ -553,11 +610,13 @@ async function sendToGemma(transcription) {
     }
 
     if (!transcription || transcription.trim() === '') {
-        console.log('Empty transcription, skipping Gemma');
+        console.log('Empty transcription, skipping Gemini');
         return;
     }
 
-    console.log('Sending to Gemma:', transcription.substring(0, 100) + '...');
+    const model = GEMINI_TEXT_FALLBACK_MODEL;
+    console.log(`Sending to ${model}:`, transcription.substring(0, 100) + '...');
+    logTransportEvent('gemini.text.request', { model, transcription });
 
     groqConversationHistory.push({
         role: 'user',
@@ -582,9 +641,10 @@ async function sendToGemma(transcription) {
         ];
 
         const response = await ai.models.generateContentStream({
-            model: 'gemma-4-26b-a4b-it',
+            model,
             contents: messagesWithSystem,
         });
+        incrementLimitCount(model);
 
         let fullText = '';
         let isFirst = true;
@@ -597,13 +657,6 @@ async function sendToGemma(transcription) {
                 isFirst = false;
             }
         }
-
-        const systemPromptChars = (currentSystemPrompt || 'You are a helpful assistant.').length;
-        const historyChars = trimmedHistory.reduce((sum, msg) => sum + (msg.content || '').length, 0);
-        const inputChars = systemPromptChars + historyChars;
-        const outputChars = fullText.length;
-
-        incrementCharUsage('gemini', 'gemma-4-26b-a4b-it', inputChars + outputChars);
 
         if (fullText.trim()) {
             groqConversationHistory.push({
@@ -618,11 +671,22 @@ async function sendToGemma(transcription) {
             saveConversationTurn(transcription, fullText);
         }
 
-        console.log('Gemma response completed');
+        logTransportEvent('gemini.text.completed', { model, response: fullText });
+        console.log(`Gemini response completed (${model})`);
         sendToRenderer('update-status', 'Listening...');
     } catch (error) {
-        console.error('Error calling Gemma API:', error);
-        sendToRenderer('update-status', 'Gemma error: ' + error.message);
+        console.error('Error calling Gemini API:', error);
+        logTransportEvent('gemini.text.error', { model, error: error.message });
+        // Leave history ending on an assistant turn so the next question starts clean
+        groqConversationHistory.pop();
+        if (isGeminiDailyQuotaError(error)) {
+            markModelExhausted(model);
+            sendToRenderer('update-status', 'Groq and Gemini daily limits reached');
+        } else if (isGeminiQuotaError(error)) {
+            sendToRenderer('update-status', 'Gemini limit reached, try again in a minute');
+        } else {
+            sendToRenderer('update-status', 'Gemini error: ' + error.message);
+        }
     }
 }
 
@@ -993,14 +1057,24 @@ async function sendAudioToGemini(base64Data, geminiSessionRef) {
     }
 }
 
-async function sendImageToGeminiHttp(base64Data, prompt) {
+// A model that has sent no text by then is treated as overloaded and the next one is tried
+const GEMINI_IMAGE_FIRST_TEXT_TIMEOUT_MS = 20000;
+
+async function sendImageToGeminiHttp(base64Data, prompt, triedModels = []) {
     // Get available model based on rate limits
-    const model = getAvailableModel();
+    const model = getAvailableModel(triedModels);
+    if (!model) {
+        return { success: false, error: 'All Gemini models are busy or out of quota, try again shortly' };
+    }
 
     const apiKey = getApiKey();
     if (!apiKey) {
         return { success: false, error: 'No API key configured' };
     }
+
+    const controller = new AbortController();
+    const firstTextTimer = setTimeout(() => controller.abort(), GEMINI_IMAGE_FIRST_TEXT_TIMEOUT_MS);
+    let fullText = '';
 
     try {
         const ai = new GoogleGenAI({ apiKey: apiKey });
@@ -1019,17 +1093,18 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
         const response = await ai.models.generateContentStream({
             model: model,
             contents: contents,
+            config: { abortSignal: controller.signal },
         });
 
         // Increment count after successful call
         incrementLimitCount(model);
 
         // Stream the response
-        let fullText = '';
         let isFirst = true;
         for await (const chunk of response) {
             const chunkText = chunk.text;
             if (chunkText) {
+                clearTimeout(firstTextTimer);
                 fullText += chunkText;
                 // Send to renderer - new response for first chunk, update for subsequent
                 sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
@@ -1044,8 +1119,18 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
 
         return { success: true, text: fullText, model: model };
     } catch (error) {
-        console.error('Error sending image to Gemini HTTP:', error);
+        console.error(`Error sending image to ${model}:`, error.message);
+        logTransportEvent('gemini.image.error', { model, error: error.message, timedOut: controller.signal.aborted });
+        if (isGeminiDailyQuotaError(error)) {
+            markModelExhausted(model);
+        }
+        // Overloaded, slow, out of quota or erroring: try the next model, unless an answer already started
+        if (!fullText) {
+            return sendImageToGeminiHttp(base64Data, prompt, [...triedModels, model]);
+        }
         return { success: false, error: error.message };
+    } finally {
+        clearTimeout(firstTextTimer);
     }
 }
 
@@ -1197,8 +1282,14 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 return result;
             }
 
-            const result = hasGroqKey() ? await sendImageToGroq(data, prompt) : await sendImageToGeminiHttp(data, prompt);
-            return result;
+            if (isGroqAvailable()) {
+                const groqResult = await sendImageToGroq(data, prompt);
+                if (groqResult.success) {
+                    return groqResult;
+                }
+                console.log('Groq image request failed, answering with Gemini:', groqResult.error);
+            }
+            return await sendImageToGeminiHttp(data, prompt);
         } catch (error) {
             console.error('Error sending image:', error);
             return { success: false, error: error.message };

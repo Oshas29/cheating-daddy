@@ -270,9 +270,17 @@ function setLimits(limits) {
 }
 
 function getTodayDateString() {
-    const now = new Date();
-    return now.toISOString().split('T')[0]; // YYYY-MM-DD
+    // Gemini's daily quotas reset at midnight Pacific, so count days on that clock
+    return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' }); // YYYY-MM-DD
 }
+
+// Free-tier requests per day, tried in this order for Gemini text and image calls
+// 3.6 Flash leads because 3.8 Flash often returns 503 "high demand" or stalls.
+const GEMINI_DAILY_MODELS = [
+    { model: 'gemini-3.6-flash', key: 'flash', limit: 20 },
+    { model: 'gemini-3.8-flash', key: 'flash38', limit: 20 },
+    { model: 'gemini-3.5-flash-lite', key: 'flashLite', limit: 500 },
+];
 
 function getTodayLimits() {
     const limits = getLimits();
@@ -343,15 +351,26 @@ function incrementLimitCount(model) {
         limits.data = limits.data.filter(entry => entry.date === today);
     }
 
-    // Increment the appropriate model count
-    if (model === 'gemini-3.6-flash' || model === 'gemini-3.8-flash') {
-        todayEntry.flash.count++;
-    } else if (model === 'gemini-3.5-flash-lite') {
-        todayEntry.flashLite.count++;
+    const entry = GEMINI_DAILY_MODELS.find(m => m.model === model);
+    if (entry) {
+        todayEntry[entry.key] = todayEntry[entry.key] || { count: 0 };
+        todayEntry[entry.key].count++;
     }
 
     setLimits(limits);
     return todayEntry;
+}
+
+// Google said this model's quota is used up, so skip it for the rest of the day
+function markModelExhausted(model) {
+    const entry = GEMINI_DAILY_MODELS.find(m => m.model === model);
+    if (!entry) return;
+
+    const todayEntry = getTodayLimits();
+    const limits = getLimits();
+    const stored = limits.data.find(e => e.date === todayEntry.date);
+    stored[entry.key] = { count: entry.limit };
+    setLimits(limits);
 }
 
 function incrementCharUsage(provider, model, charCount) {
@@ -369,18 +388,17 @@ function incrementCharUsage(provider, model, charCount) {
     return todayEntry;
 }
 
-function getAvailableModel() {
+// `skipModels` are ones that already failed for this request; null once nothing is left to try
+function getAvailableModel(skipModels = []) {
     const todayLimits = getTodayLimits();
+    const candidates = GEMINI_DAILY_MODELS.filter(m => !skipModels.includes(m.model));
 
-    // RPD limits: flash = 20, flash-lite = 20
-    // After both exhausted, fall back to flash (for paid API users)
-    if (todayLimits.flash.count < 20) {
-        return 'gemini-3.6-flash';
-    } else if (todayLimits.flashLite.count < 20) {
-        return 'gemini-3.5-flash-lite';
-    }
+    const available = candidates.find(m => (todayLimits[m.key]?.count || 0) < m.limit);
+    if (available) return available.model;
 
-    return 'gemini-3.6-flash'; // Default to flash for paid API users
+    // Once all are used, keep trying the last one (paid API users have higher limits)
+    const last = GEMINI_DAILY_MODELS[GEMINI_DAILY_MODELS.length - 1].model;
+    return skipModels.includes(last) ? null : last;
 }
 
 function getModelForToday() {
@@ -541,6 +559,7 @@ module.exports = {
     setLimits,
     getTodayLimits,
     incrementLimitCount,
+    markModelExhausted,
     getAvailableModel,
     incrementCharUsage,
     getModelForToday,
