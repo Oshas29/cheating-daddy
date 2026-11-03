@@ -40,5 +40,8 @@
         "@electron/fuses": "^1.8.0",
         "@reforged/maker-appimage": "^5.0.0",
         "electron": "^30.0.5"
+    },
+    "allowScripts": {
+        "electron@30.5.1": true
     }
 }
