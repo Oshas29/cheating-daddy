@@ -42,6 +42,7 @@
         "electron": "^30.0.5"
     },
     "allowScripts": {
-        "electron@30.5.1": true
+        "electron@30.5.1": true,
+        "electron-winstaller@5.4.0": true
     }
 }
