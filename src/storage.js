@@ -166,9 +166,12 @@ function initializeStorage() {
 
 function getConfig() {
     const saved = readJsonFile(getConfigPath(), {});
-    // Existing installs saved the old default live model, which Google now marks as legacy
-    if (saved.geminiLiveModel === 'gemini-3.1-flash-live-preview') {
-        delete saved.geminiLiveModel;
+    // Existing installs saved the old default live model, which Google now marks as legacy.
+    // Move them once, so someone who picks the old model again afterwards keeps it.
+    if (!saved.liveModelMigrated && saved.geminiLiveModel === 'gemini-3.1-flash-live-preview') {
+        saved.geminiLiveModel = DEFAULT_CONFIG.geminiLiveModel;
+        saved.liveModelMigrated = true;
+        writeJsonFile(getConfigPath(), saved);
     }
     return { ...DEFAULT_CONFIG, ...saved };
 }
